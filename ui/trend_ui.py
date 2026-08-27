@@ -3096,7 +3096,8 @@ def show_trend_ui(root, back, login_data=None):
         get_active,
         write_log,
         update_current_lot,
-        close_all
+        username=username,
+        close_app=close_all
     )
     # ========================================================
     # INITIAL LOG

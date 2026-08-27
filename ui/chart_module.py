@@ -41,6 +41,7 @@ pending_closed_ticket = None
 pending_closed_trade = None
 pending_close_time = None
 pending_close_timeout = 60
+current_username = None
 def get_multi_lot_index():
     return multi_lot_index
 def is_auto_running():
@@ -409,9 +410,7 @@ def place_order(signal, lot, df, log, current):
         # ACCOUNT
         # ==============================
 
-        "account": str(account_info.login)
-            if account_info
-            else None,
+        "account": current_username,
 
         # ==============================
         # TRADE
@@ -1573,20 +1572,15 @@ def stop_auto(log):
         "✅ Đã đóng tất cả lệnh"
     )
 def write_log_api(logs):
-    try:
-        account_info = mt5.account_info()
+    global current_username
 
-        if account_info is None:
-            print(
-                "❌ WRITE LOG: "
-                "Không lấy được account MT5"
-            )
+    try:
+        if not current_username:
+            print("❌ WRITE LOG: Không có username")
             return False
 
-        account = str(account_info.login)
-
         data = {
-            "account": account,
+            "account": current_username,
             "logs": "\n".join(logs)
         }
 
@@ -1707,10 +1701,9 @@ def log_common(msg, delay=2):
 
     account_info = mt5.account_info()
 
-    if account_info is None:
-        account = "UNKNOWN"
-    else:
-        account = str(account_info.login)
+    global current_username
+
+    account = current_username or "UNKNOWN"
 
     # ==========================================
     # LƯU LOG
@@ -1743,9 +1736,14 @@ def draw_chart(
     active,
     log,
     update_current_lot_callback,
+    username=None,
     close_app=None
 ):
     global update_current_lot
+    global current_username
+
+    # Lưu username đã login
+    current_username = username
 
     update_current_lot = update_current_lot_callback
     fig, ax = plt.subplots(figsize=(9, 5))
