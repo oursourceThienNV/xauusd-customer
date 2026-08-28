@@ -691,11 +691,8 @@ def show_trend_ui(root, back, login_data=None):
     # --------------------------------------------------------
 
     default_lots = [
-        round(
-            0.01 * (2 ** i),
-            2
-        )
-        for i in range(10)
+        round(0.01 * (i + 1), 2)
+        for i in range(5)
     ]
 
     # --------------------------------------------------------
@@ -2079,7 +2076,7 @@ def show_trend_ui(root, back, login_data=None):
 
     tk.Label(
         low_card,
-        text="(20% - 25%/tháng • Rủi ro tối thiểu)",
+        text="",
         bg="#101b38",
         fg="#f0a84b",
         font=("Arial", 9, "bold")
@@ -2188,7 +2185,7 @@ def show_trend_ui(root, back, login_data=None):
 
     tk.Label(
         high_card,
-        text="(30% - 40%/tháng • Sóng MA Cross)",
+        text="",
         bg="#101b38",
         fg="#f0a84b",
         font=("Arial", 9, "bold")

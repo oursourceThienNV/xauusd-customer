@@ -17,14 +17,13 @@ max_profit_map = {}
 global_log = None
 last_log_time = {}
 log_buffer = []
-LOG_BATCH_SIZE = 60
+LOG_BATCH_SIZE = 2
 import datetime
 import time
 def now_utc_iso():
     return datetime.datetime.now(
         datetime.timezone.utc
     ).isoformat().replace("+00:00", "Z")
-dca_done = False
 last_trade_config = {}
 last_open_tickets = set()
 saved_closed_tickets = set()
@@ -40,7 +39,7 @@ last_entry_price = None
 pending_closed_ticket = None
 pending_closed_trade = None
 pending_close_time = None
-pending_close_timeout = 60
+pending_close_timeout = 360
 current_username = None
 def get_multi_lot_index():
     return multi_lot_index
@@ -183,36 +182,175 @@ def get_sl_tp(signal, price, df, symbol, current):
 
     return sl, tp
 def save_trading_transaction(transaction_data):
-
     try:
-
         response = requests.post(
             f"{API_BASE_URL}/trading-transaction",
             json=transaction_data,
             timeout=10
         )
 
-        if response.status_code != 200:
-            log_common(
-                f"❌ Trading API HTTP {response.status_code}"
-            )
-            return False
-
-        data = response.json()
-
         log_common(
-            f"💾 Trading transaction API: {data}"
+            f"📡 Trading API Response | "
+            f"Status={response.status_code} | "
+            f"Body={response.text}"
         )
 
-        return True
+        response.raise_for_status()
 
-    except Exception as e:
+        # API trả body rỗng vẫn là thành công
+        if not response.text or not response.text.strip():
+            log_common(
+                "✅ Trading transaction API thành công | "
+                f"HTTP={response.status_code} | Empty response"
+            )
+            return True
+
+        try:
+            data = response.json()
+
+            log_common(
+                f"✅ Trading transaction API thành công | "
+                f"HTTP={response.status_code} | "
+                f"Response={data}"
+            )
+
+            return True
+
+        except ValueError as e:
+            log_common(
+                f"⚠️ API HTTP thành công nhưng response không phải JSON | "
+                f"HTTP={response.status_code} | "
+                f"Body={response.text} | "
+                f"Error={e}"
+            )
+            return True
+
+    except requests.exceptions.HTTPError as e:
+        response = e.response
 
         log_common(
-            f"❌ Trading transaction API error: {e}"
+            f"❌ Trading transaction API HTTP ERROR | "
+            f"Status={response.status_code if response else 'UNKNOWN'} | "
+            f"Body={response.text if response else 'NO RESPONSE'}"
         )
 
         return False
+
+    except requests.exceptions.Timeout:
+        log_common(
+            "❌ Trading transaction API TIMEOUT | "
+            "Server không phản hồi trong thời gian quy định"
+        )
+
+        return False
+
+    except requests.exceptions.ConnectionError as e:
+        log_common(
+            f"❌ Trading transaction API CONNECTION ERROR | "
+            f"Error={e}"
+        )
+
+        return False
+
+    except Exception as e:
+        log_common(
+            f"❌ Trading transaction API UNKNOWN ERROR | "
+            f"Type={type(e).__name__} | "
+            f"Error={e}"
+        )
+
+        return False
+def process_trade_result(result, ticket):
+
+    global multi_lot_index
+    global loss_streak
+    global last_loss_signal
+    global last_entry_price
+
+    # Lấy thông tin lệnh đang chờ
+    trade = pending_closed_trade or {}
+
+    # ==========================================
+    # 1. WIN / LOSS
+    # ==========================================
+
+    if result == "WIN":
+
+        loss_streak = 0
+        last_entry_price = None
+        last_loss_signal = None
+
+        log_common(
+            f"✅ WIN | Position={ticket}"
+        )
+
+    elif result == "LOSS":
+
+        loss_streak += 1
+
+        last_loss_signal = trade.get("signal")
+        last_entry_price = trade.get("entry")
+
+        log_common(
+            f"❌ LOSS | Position={ticket}"
+        )
+
+    else:
+
+        log_common(
+            f"❌ Result không hợp lệ | "
+            f"Position={ticket} | "
+            f"Result={result}"
+        )
+
+        return False
+
+    # ==========================================
+    # 2. MULTI LOT
+    # ==========================================
+
+    if current_multi_lot and multi_lot_values:
+
+        MAX_LEVEL = min(
+            5,
+            len(multi_lot_values)
+        )
+
+        if result == "WIN":
+
+            multi_lot_index = 0
+
+            log_common(
+                "✅ WIN -> Reset L1"
+            )
+
+        elif result == "LOSS":
+
+            # Chưa đến level cuối
+            if multi_lot_index < MAX_LEVEL - 1:
+
+                multi_lot_index += 1
+
+                log_common(
+                    f"❌ LOSS -> L{multi_lot_index + 1}"
+                )
+
+            # Loss ở level cuối -> Reset L1
+            else:
+
+                multi_lot_index = 0
+
+                log_common(
+                    f"❌ LOSS L{MAX_LEVEL} -> Reset L1"
+                )
+
+        if update_current_lot:
+
+            update_current_lot(
+                multi_lot_index
+            )
+
+    return True
 def place_order(signal, lot, df, log, current):
 
     symbol = detect_symbol()
@@ -228,57 +366,111 @@ def place_order(signal, lot, df, log, current):
     if len(df) < 2:
         log_common("❌ Không đủ dữ liệu")
         return
+    entry_price = (
+        tick.ask
+        if signal == "BUY"
+        else tick.bid
+    )
+    order_type = (
+        mt5.ORDER_TYPE_BUY
+        if signal == "BUY"
+        else mt5.ORDER_TYPE_SELL
+    )
 
-    is_limit = current.get("buy_limit")
-
-    # ===== ENTRY =====
-    if is_limit:
-        entry_price = (df['high'].iloc[-2] + df['low'].iloc[-2]) / 2
-    else:
-        entry_price = tick.ask if signal == "BUY" else tick.bid
-    current_price = tick.ask if signal == "BUY" else tick.bid
-
-    # ===== AUTO SWITCH LIMIT → MARKET =====
-    if is_limit:
-        if signal == "BUY" and entry_price >= current_price:
-            log_common("⚡ Buy Limit sai → vào MARKET")
-            is_limit = False
-            entry_price = current_price
-
-        elif signal == "SELL" and entry_price <= current_price:
-            log_common("⚡ Sell Limit sai → vào MARKET")
-            is_limit = False
-            entry_price = current_price
-        # ===== ORDER TYPE =====
-    if is_limit:
-        log_common(f"⏳ Limit tại giá: {round(entry_price,2)}")
-        order_type = mt5.ORDER_TYPE_BUY_LIMIT if signal == "BUY" else mt5.ORDER_TYPE_SELL_LIMIT
-        action = mt5.TRADE_ACTION_PENDING
-        filling = mt5.ORDER_FILLING_RETURN
-    else:
-        order_type = mt5.ORDER_TYPE_BUY if signal == "BUY" else mt5.ORDER_TYPE_SELL
-        action = mt5.TRADE_ACTION_DEAL
-        filling = mt5.ORDER_FILLING_IOC
+    action = mt5.TRADE_ACTION_DEAL
 
     sl, tp = get_sl_tp(signal, entry_price, df, symbol, current)
 
     log_common(f"🚀 {signal} | Lot: {lot}")
     log_common(f"Entry: {entry_price} | SL: {sl} | TP: {tp}")
+    filling_modes = [
+        mt5.ORDER_FILLING_IOC,
+        mt5.ORDER_FILLING_FOK,
+        mt5.ORDER_FILLING_RETURN
+    ]
 
-    request = {
-        "action": action,
-        "symbol": symbol,
-        "volume": lot,
-        "type": order_type,
-        "price": entry_price,
-        "sl": sl,
-        "tp": tp,
-        "deviation": 20,
-        "magic": 999999,
-        "comment": "AUTO BOT",
-        "type_time": mt5.ORDER_TIME_GTC,
-        "type_filling": filling
-    }
+    result = None
+    used_filling = None
+
+    # Chống mở trùng trước khi gửi lệnh
+    existing_positions = mt5.positions_get(
+        symbol=symbol
+    )
+
+    if existing_positions:
+        log_common(
+            "⛔ Đã có position đang mở, không mở thêm"
+        )
+        return
+
+    # Thử từng Filling Mode
+    for filling in filling_modes:
+
+        request = {
+            "action": action,
+            "symbol": symbol,
+            "volume": float(lot),
+            "type": order_type,
+            "price": float(entry_price),
+            "sl": float(sl),
+            "tp": float(tp),
+            "deviation": 20,
+            "magic": 999999,
+            "comment": "AUTO BOT",
+            "type_time": mt5.ORDER_TIME_GTC,
+            "type_filling": filling
+        }
+
+        log_common(
+            f"📤 Đang gửi lệnh MT5 | "
+            f"Filling={filling}"
+        )
+
+        result = mt5.order_send(request)
+
+        log_common(
+            f"📥 MT5 Response | "
+            f"Filling={filling} | "
+            f"Result={result}"
+        )
+
+        if result is None:
+
+            log_common(
+                f"❌ order_send trả về None | "
+                f"Error={mt5.last_error()}"
+            )
+
+            continue
+
+        if result.retcode == mt5.TRADE_RETCODE_DONE:
+
+            used_filling = filling
+
+            log_common(
+                f"✅ Order thành công | "
+                f"Filling={used_filling} | "
+                f"Order={result.order} | "
+                f"Deal={result.deal}"
+            )
+
+            break
+
+        log_common(
+            f"⚠️ Filling={filling} thất bại | "
+            f"Retcode={result.retcode} | "
+            f"Comment={getattr(result, 'comment', '')}"
+        )
+
+    # Không filling mode nào thành công
+    if (
+        result is None
+        or result.retcode != mt5.TRADE_RETCODE_DONE
+    ):
+        log_common(
+            "❌ Mở lệnh thất bại với tất cả Filling Mode"
+        )
+        return
     global last_trade_config
 
     last_trade_config = {
@@ -305,21 +497,11 @@ def place_order(signal, lot, df, log, current):
 
         "ema_value":
             current.get("ema_value"),
-
-        "buy_limit":
-            current.get("buy_limit"),
-
-        "dca":
-            current.get("dca"),
-
         "trailing":
             current.get("trailing"),
 
         "be":
             current.get("be"),
-
-        "reverse":
-            current.get("reverse"),
 
         "sideway_filter":
             current.get("sideway_filter"),
@@ -350,28 +532,19 @@ def place_order(signal, lot, df, log, current):
             )
         
     }
-    existing_positions = mt5.positions_get(
-    symbol=symbol
-    )
+   
+    positions = None
 
-    if existing_positions:
-        log_common(
-            "⛔ Đã có position đang mở, không mở thêm"
+    for _ in range(5):
+
+        time.sleep(0.5)
+
+        positions = mt5.positions_get(
+            symbol=symbol
         )
-        return
-    result = mt5.order_send(request)
 
-    log_common(f"📩 MT5: {result}")
-
-    if not result or result.retcode != mt5.TRADE_RETCODE_DONE:
-        log_common(
-            f"❌ Mở lệnh thất bại | retcode={getattr(result, 'retcode', None)}"
-        )
-        return
-
-    time.sleep(0.5)
-
-    positions = mt5.positions_get(symbol=symbol)
+        if positions:
+            break
 
     if not positions:
         log_common(
@@ -381,6 +554,12 @@ def place_order(signal, lot, df, log, current):
 
     position_id = positions[0].ticket
     last_trade_config["ticket"] = position_id
+    global last_open_tickets
+
+    last_open_tickets = {
+        p.ticket
+        for p in positions
+    }
 
     if position_id is None:
         log_common(
@@ -620,75 +799,6 @@ def trailing_after_be(pos, log):
         if new_sl < pos.sl:
             log_common(f"🔄 Trailing SELL → SL: {round(new_sl,2)}")
             update_sl(pos, new_sl, log)
-def handle_dca(df, current, log):
-    global dca_done
-
-    if not current.get("dca"):
-        return
-
-    symbol = detect_symbol()
-    positions = mt5.positions_get(symbol=symbol)
-    has_position = positions is not None and len(positions) > 0
-
-    if positions is None or len(positions) == 0:
-        return
-
-    # ❌ chỉ tối đa 2 lệnh
-    if len(positions) >= 2:
-        return
-
-    # ❌ chỉ DCA 1 lần
-    if dca_done:
-        return
-
-    pos = positions[0]
-
-    tick = mt5.symbol_info_tick(symbol)
-    if tick is None:
-        return
-
-    price = tick.bid if pos.type == mt5.POSITION_TYPE_BUY else tick.ask
-
-    entry = pos.price_open
-    sl = pos.sl
-    tp = pos.tp
-
-    if sl == 0:
-        return
-
-    # 🎯 điều kiện DCA
-    mid_price = (entry + sl) / 2
-
-    if pos.type == mt5.POSITION_TYPE_BUY:
-        if price > mid_price:
-            return
-        order_type = mt5.ORDER_TYPE_BUY
-    else:
-        if price < mid_price:
-            return
-        order_type = mt5.ORDER_TYPE_SELL
-
-    log_common("📉 DCA 1 lần")
-
-    request = {
-        "action": mt5.TRADE_ACTION_DEAL,
-        "symbol": symbol,
-        "volume": pos.volume,
-        "type": order_type,
-        "price": price,
-        "sl": sl,
-        "tp": tp,
-        "deviation": 20,
-        "magic": 999999,
-        "comment": "DCA",
-        "type_time": mt5.ORDER_TIME_GTC,
-        "type_filling": mt5.ORDER_FILLING_IOC
-    }
-
-    result = mt5.order_send(request)
-    log_common(f"📩 DCA: {result}")
-
-    dca_done = True
 def close_position(pos, log):
     symbol = pos.symbol
 
@@ -723,8 +833,7 @@ def update_closed_trade(ticket):
     for i in range(30):
 
         deals = mt5.history_deals_get(
-            datetime.datetime(2000, 1, 1),
-            datetime.datetime.now()
+            position=ticket
         )
 
         close_deals = [
@@ -783,7 +892,10 @@ def update_closed_trade(ticket):
 
                 "updatedDt": now_utc_iso()
             }
-
+            log_common(
+                f"📤 UPDATE DB Request | "
+                f"Data={update_data}"
+            )
             success = save_trading_transaction(
                 update_data
             )
@@ -795,7 +907,12 @@ def update_closed_trade(ticket):
                     f"Ticket={ticket} | "
                     f"Profit={round(profit, 2)}"
                 )
-
+            else:
+                log_common(
+                    f"❌ UPDATE DB thất bại | "
+                    f"Ticket={ticket} | "
+                    f"Result={update_data['result']}"
+                )
             return success
 
         log_common(
@@ -965,8 +1082,7 @@ def check_closed_positions(symbol):
     try:
 
         deals = mt5.history_deals_get(
-            datetime.datetime(2000, 1, 1),
-            datetime.datetime.now()
+            position=pending_closed_ticket
         )
 
         log_common(
@@ -1074,72 +1190,26 @@ def check_closed_positions(symbol):
             duration = 0
 
         # ==================================================
-        # 8. WIN / LOSS
+        # 8. XÁC ĐỊNH KẾT QUẢ
         # ==================================================
 
-        if profit >= 0:
-
-            loss_streak = 0
-            last_entry_price = None
-            last_loss_signal = None
-
-        else:
-
-            loss_streak += 1
-            last_loss_signal = trade.get("signal")
-            last_entry_price = trade.get("entry")
+        trade_result = (
+            "WIN"
+            if profit >= 0
+            else "LOSS"
+        )
 
         # ==================================================
-        # 9. MULTI LOT
+        # 9. XỬ LÝ KẾT QUẢ - CHỈ 1 NƠI
         # ==================================================
 
-        if current_multi_lot and multi_lot_values:
+        processed = process_trade_result(
+            trade_result,
+            ticket
+        )
 
-            if profit >= 0:
-
-                log_common(
-                    "✅ WIN/BE -> Reset L1"
-                )
-
-                multi_lot_index = 0
-
-                if update_current_lot:
-                    update_current_lot(0)
-
-            else:
-
-                if (
-                    multi_lot_index
-                    < len(multi_lot_values) - 1
-                ):
-
-                    multi_lot_index += 1
-
-                    log_common(
-                        f"❌ LOSS -> "
-                        f"L{multi_lot_index + 1}"
-                    )
-
-                    if update_current_lot:
-                        update_current_lot(
-                            multi_lot_index
-                        )
-
-                else:
-
-                    log_common(
-                        "🛑 LOSS L10 -> STOP BOT"
-                    )
-
-                    auto_running = False
-                    multi_lot_index = 0
-
-                    if update_current_lot:
-                        update_current_lot(0)
-
-        # ==================================================
-        # 10. UPDATE MEMORY
-        # ==================================================
+        if not processed:
+            return
 
         close_price = None
 
@@ -1176,11 +1246,8 @@ def check_closed_positions(symbol):
             "tradeStatus":
                 "CLOSED",
 
-            "result":
-                "WIN"
-                if profit >= 0
-                else "LOSS",
-
+            "result":trade_result,
+                
             "syncStatus":
                 "SYNCED",
 
@@ -1191,15 +1258,25 @@ def check_closed_positions(symbol):
                 now_utc_iso()
         }
 
-        save_trading_transaction(update_data)
+        success = save_trading_transaction(update_data)
 
-        # ==================================================
-        # 11. ĐÃ XÁC NHẬN XONG → RESET PENDING
-        # ==================================================
+        if success:
 
+            log_common(
+                "✅ Đã xử lý WIN/LOSS và cập nhật DB xong"
+            )
+
+        else:
+
+            log_common(
+                f"❌ UPDATE DB thất bại | "
+                f"Position={ticket} | "
+            )
+    # ==========================================
         pending_closed_ticket = None
         pending_closed_trade = None
         pending_close_time = None
+        return
 
     except Exception as e:
 
@@ -1353,17 +1430,12 @@ def apply_session(current):
             if not current.get("multi_lot"):
                 current["lot"] = s.get("lot",0.1)
 
-            current["buy_limit"] = s.get("buy_limit", False)
-
-            current["dca"] = s.get("dca", False)
-
             current["rr_reward"] = s.get("rr_reward", 1.5)
             current["rr_risk"] = s.get("rr_risk", 1)
 
             current["trailing"] = s.get("trailing", False)
 
             current["be"] = s.get("be", False)
-            current["reverse"] = s.get("reverse", False)
 
             current["sideway_filter"] = s.get("sideway_filter", False)
 
@@ -1481,8 +1553,6 @@ def start_auto(log, get_config=None, close_app=None):
     return True
 def stop_auto(log):
     global auto_running
-    global dca_done
-
     auto_running = False
 
     symbol = detect_symbol()
@@ -1566,8 +1636,6 @@ def stop_auto(log):
     if update_current_lot:
         update_current_lot(0)
 
-    dca_done = False
-
     log_common(
         "✅ Đã đóng tất cả lệnh"
     )
@@ -1590,82 +1658,10 @@ def write_log_api(logs):
             timeout=10
         )
 
-        # ==========================================
-        # HTTP OK
-        # ==========================================
-
-        if response.status_code == 200:
-
-            try:
-                result = response.json()
-            except Exception:
-                result = None
-
-            # ======================================
-            # ACCOUNT HỢP LỆ
-            # ======================================
-
-            if result is True:
-
-                print(
-                    f"✅ WRITE LOG thành công | "
-                    f"Account={account} | "
-                    f"Logs={len(logs)}"
-                )
-
-                return True
-
-            # ======================================
-            # ACCOUNT KHÔNG HỢP LỆ
-            # ======================================
-
-            print(
-                f"🚨 Tài khoản không hợp lệ | "
-                f"Account={account}"
-            )
-
-            messagebox.showerror(
-                "Thông báo",
-                "Tài khoản không hợp lệ "
-                "hoặc đã bị khóa.\n\n"
-                "Ứng dụng sẽ được đóng."
-            )
-
-            os._exit(0)
-
-        # ==========================================
-        # HTTP ERROR
-        # ==========================================
-
-        print(
-            f"❌ WRITE LOG thất bại | "
-            f"HTTP={response.status_code}"
-        )
-
-        return False
-
-    except requests.exceptions.Timeout:
-
-        print(
-            "❌ WRITE LOG API TIMEOUT"
-        )
-
-        return False
-
-    except requests.exceptions.ConnectionError:
-
-        print(
-            "❌ WRITE LOG API CONNECTION ERROR"
-        )
-
-        return False
+        return response.status_code == 200
 
     except Exception as e:
-
-        print(
-            f"❌ WRITE LOG API ERROR: {e}"
-        )
-
+        print(f"❌ WRITE LOG API ERROR: {e}")
         return False
 def log_common(msg, delay=2):
     global global_log
@@ -1834,36 +1830,72 @@ def draw_chart(
 
     cursor.connect("add", on_hover)
     def update():
+
         global cross_points, last_params
-        global dca_done
         global auto_running
+        global current_multi_lot
+        global multi_lot_values
+
+        global pending_closed_ticket
+        global pending_close_time
+
+        # ==================================================
+        # 1. LẤY DỮ LIỆU
+        # ==================================================
 
         df = get_data()
 
         if df is None:
+
             parent.after(2000, update)
             return
 
-        
-        
+
+        # ==================================================
+        # 2. RESET DATA HIỂN THỊ
+        # ==================================================
 
         candles.clear()
         signals.clear()
         cross_points.clear()
 
-        x = df['time']
-        price = df['close']
+        x = df["time"]
+        price = df["close"]
+
+
+        # ==================================================
+        # 3. LẤY CONFIG HIỆN TẠI
+        # ==================================================
 
         current = active()
         current = apply_session(current)
-        global current_multi_lot
-        global multi_lot_values
 
-        current_multi_lot = current.get("multi_lot", False)
-        multi_lot_values = current.get("lots", [])
-        # ===== AUTO TRADE =====
+        current_multi_lot = current.get(
+            "multi_lot",
+            False
+        )
+
+        multi_lot_values = current.get(
+            "lots",
+            []
+        )
+
+
+        # ==================================================
+        # 4. AUTO TRADE
+        # ==================================================
+
         if auto_running:
-            if current.get("friday_lock") and is_weekend_lock():
+
+
+            # ==============================================
+            # 4.1 WEEKEND LOCK
+            # ==============================================
+
+            if (
+                current.get("friday_lock")
+                and is_weekend_lock()
+            ):
 
                 log_common(
                     "🔒 WEEKEND LOCK | "
@@ -1883,441 +1915,283 @@ def draw_chart(
                     if close_app:
                         close_app()
 
+                parent.after(2000, update)
                 return
+
+
+            # ==============================================
+            # 4.2 XÁC ĐỊNH SYMBOL
+            # ==============================================
+
             symbol = detect_symbol()
 
-            check_closed_positions(symbol)
-            if pending_closed_ticket is not None:
-
-                elapsed = (
-                    datetime.datetime.now()
-                    - pending_close_time
-                ).total_seconds()
-
-                if elapsed >= pending_close_timeout:
-
-                    log_common(
-                        "🚨 CẢNH BÁO HỆ THỐNG: "
-                        "Phát hiện người dùng đã thao tác đóng lệnh "
-                        "trực tiếp trên MT5. "
-                        "Không thể xác nhận lịch sử giao dịch. "
-                        "Vui lòng khởi động lại bot để tiếp tục."
-                    )
-
-                    auto_running = False
-                    return
+            if symbol is None:
 
                 log_common(
-                    f"⏳ Đang chờ xác nhận lệnh "
-                    f"Position={pending_closed_ticket} | "
-                    f"{int(elapsed)}/{pending_close_timeout}s"
+                    "❌ Không tìm thấy symbol"
                 )
 
                 parent.after(2000, update)
                 return
 
-            positions = mt5.positions_get(symbol=symbol)
-            
-            if positions is None or len(positions) == 0:
-                dca_done = False
-            orders = mt5.orders_get(symbol=symbol)
-            # ===== CÓ LỆNH =====
+
+            # ==============================================
+            # 4.3 KIỂM TRA LỆNH VỪA ĐÓNG
+            #
+            # QUAN TRỌNG:
+            #
+            # Hàm này phải xử lý:
+            #
+            # Position đóng
+            # → lấy MT5 history
+            # → xác định WIN/LOSS
+            # → process_trade_result()
+            # → update DB
+            #
+            # pending chỉ được clear khi hoàn tất
+            # ==============================================
+
+            check_closed_positions(symbol)
+
+
+            # ==============================================
+            # 4.4 NẾU CÒN PENDING
+            #
+            # TUYỆT ĐỐI KHÔNG CHECK TÍN HIỆU MỚI
+            # TUYỆT ĐỐI KHÔNG VÀO LỆNH MỚI
+            # ==============================================
+
+            if pending_closed_ticket is not None:
+
+                # ==========================================
+                # KIỂM TRA TIMEOUT
+                # ==========================================
+
+                if pending_close_time is not None:
+
+                    elapsed = (
+                        datetime.datetime.now()
+                        - pending_close_time
+                    ).total_seconds()
+
+                    if elapsed >= pending_close_timeout:
+
+                        ticket = pending_closed_ticket
+
+                        log_common(
+                            f"🚨 Không thể hoàn tất xử lý "
+                            f"lệnh đã đóng sau "
+                            f"{int(elapsed)} giây | "
+                            f"Position={ticket}"
+                        )
+
+                        auto_running = False
+
+                        messagebox.showwarning(
+                            "Bot tạm dừng",
+                            "Không thể hoàn tất xử lý giao dịch "
+                            "từ MT5 trong thời gian cho phép.\n\n"
+                            "Bot đã tạm dừng để tránh tiếp tục "
+                            "giao dịch với sai mức lot.\n\n"
+                            "Vui lòng kiểm tra:\n"
+                            "- Kết nối mạng\n"
+                            "- Kết nối MT5\n"
+                            "- MT5 Terminal\n"
+                            "- Server Database\n\n"
+                            "Sau khi kiểm tra, vui lòng "
+                            "khởi động lại bot."
+                        )
+
+                        parent.after(2000, update)
+                        return
+
+
+                # ==========================================
+                # VẪN ĐANG XỬ LÝ
+                # ==========================================
+
+                log_common(
+                    f"⏳ Đang xử lý lệnh vừa đóng | "
+                    f"Position={pending_closed_ticket} | "
+                    f"Không vào lệnh mới"
+                )
+
+                parent.after(2000, update)
+                return
+
+
+            # ==================================================
+            # TỚI ĐƯỢC ĐÂY CÓ NGHĨA:
+            #
+            # - Không có lệnh pending
+            # - WIN/LOSS đã xử lý xong
+            # - Logic Multi Lot đã xử lý xong
+            # - DB đã update xong
+            #
+            # → BÂY GIỜ MỚI ĐƯỢC CHECK LỆNH MỚI
+            # ==================================================
+
+
+            # ==============================================
+            # 4.5 KIỂM TRA POSITION HIỆN TẠI
+            # ==============================================
+
+            positions = mt5.positions_get(
+                symbol=symbol
+            )
+
+            orders = mt5.orders_get(
+                symbol=symbol
+            )
+
+
+            # ==============================================
+            # 4.6 ĐANG CÓ POSITION
+            # ==============================================
+
             if positions is not None and len(positions) > 0:
 
                 if len(positions) >= 2:
-                    log_common("⛔ Đã đủ 2 lệnh")
+
+                    log_common(
+                        "⛔ Đã đủ 2 lệnh"
+                    )
 
                 else:
-                    pos = sorted(positions, key=lambda x: x.time)[0]
 
-                    current_type = "BUY" if pos.type == mt5.POSITION_TYPE_BUY else "SELL"
+                    pos = sorted(
+                        positions,
+                        key=lambda x: x.time
+                    )[0]
 
-                    signal = None
+                    log_common(
+                        f"📊 Đang có lệnh | "
+                        f"Profit: {round(pos.profit, 2)}"
+                    )
 
-                    if current.get("reverse"):
-                        signal = get_signal(df, current, log)
-                    
-                    # 🔥 ĐẢO CHIỀU
-                    if current.get("reverse") and signal and signal != current_type:
 
-                        log_common(f"🔄 Đảo chiều {current_type} → {signal}")
-
-                        close_position(pos, log)
-
-                        time.sleep(1)
-
-                        lot = current.get("lot", 0.1)
-
-                        if current_multi_lot:
-
-                            if len(multi_lot_values)==0:
-
-                                log_common("❌ Chưa nhập Multi Lot")
-
-                            else:
-
-                                index=min(
-                                    multi_lot_index,
-                                    len(multi_lot_values)-1
-                                )
-
-                                lot=multi_lot_values[index]
-
-                        place_order(signal, lot, df, log, current)
-
-                        log_common("✅ Đã đảo chiều")
-
-                    # ✅ KHÔNG ĐẢO → xử lý như cũ
-                    log_common(f"📊 Đang có lệnh | Profit: {round(pos.profit,2)}")
+                    # ======================================
+                    # BREAK EVEN
+                    # ======================================
 
                     if current.get("be"):
-                        trailing_stop_percent(pos, log)
+
+                        trailing_stop_percent(
+                            pos,
+                            log
+                        )
+
+
+                    # ======================================
+                    # TRAILING
+                    # ======================================
 
                     if current.get("trailing"):
-                        trailing_after_be(pos, log)
-                   
-                    if current.get("dca"):
-                        handle_dca(df, current, log)
+
+                        trailing_after_be(
+                            pos,
+                            log
+                        )
+
+
+            # ==============================================
+            # 4.7 CÓ PENDING ORDER
+            # ==============================================
 
             elif orders is not None and len(orders) > 0:
-                log_common("⏳ Đang có lệnh chờ (pending)...")
+
+                log_common(
+                    "⏳ Đang có lệnh chờ (pending)..."
+                )
+
+
+            # ==============================================
+            # 4.8 KHÔNG CÓ POSITION
+            # → BÂY GIỜ MỚI ĐƯỢC TÌM TÍN HIỆU MỚI
+            # ==============================================
 
             else:
-                signal = get_signal(df, current, log)
+
+                signal = get_signal(
+                    df,
+                    current,
+                    log
+                )
+
 
                 if signal:
 
-                    log_common(f"🎯 Tín hiệu: {signal}")
+                    log_common(
+                        f"🎯 Tín hiệu: {signal}"
+                    )
 
-                    lot = current.get("lot",0.1)
+
+                    # ======================================
+                    # LOT MẶC ĐỊNH
+                    # ======================================
+
+                    lot = current.get(
+                        "lot",
+                        0.1
+                    )
+
+
+                    # ======================================
+                    # MULTI LOT
+                    # ======================================
 
                     if current_multi_lot:
 
-                        if len(multi_lot_values)==0:
+                        if not multi_lot_values:
 
-                            log_common("❌ Chưa nhập Multi Lot")
-
-                        else:
-
-                            index=min(
-                                multi_lot_index,
-                                len(multi_lot_values)-1
+                            log_common(
+                                "❌ Chưa nhập Multi Lot"
                             )
 
-                            lot=multi_lot_values[index]
+                            # Không vào lệnh nếu bật
+                            # Multi Lot nhưng chưa có dữ liệu
+                            parent.after(2000, update)
+                            return
 
-                    place_order(signal, lot, df, log, current)
-        # ===== RESET EMA =====
-#        ax.cla()
-#        ax.set_facecolor("#020617")
-        
 
-        # ========================
-        # CANDLE
-        # ========================
-#        for i in range(len(df)):
-#            o, c = df['open'].iloc[i], df['close'].iloc[i]
-#            h, l = df['high'].iloc[i], df['low'].iloc[i]
+                        MAX_LEVEL = min(
+                            5,
+                            len(multi_lot_values)
+                        )
 
-#            color = "#22c55e" if c >= o else "#ef4444"
+                        index = min(
+                            multi_lot_index,
+                            MAX_LEVEL - 1
+                        )
 
-#            line = ax.plot(
-#                [x.iloc[i], x.iloc[i]],
-#                [l, h],
-#                color=color,
-#                linewidth=2,
-#                picker=True
-#            )[0]
+                        lot = multi_lot_values[index]
 
-#            candles.append({
-#                "artist": line,
-#                "time": x.iloc[i],
-#                "open": o,
-#                "close": c,
-#                "high": h,
-#                "low": l
-#            })
 
-#            ax.plot([x.iloc[i], x.iloc[i]], [o, c], color=color, linewidth=4)
+                        log_common(
+                            f"📊 Multi Lot | "
+                            f"L{index + 1} | "
+                            f"Lot={lot}"
+                        )
 
-        # ========================
-        # EMA CROSS
-        # ========================
-        # ========================
-        # EMA CROSS + SIGNAL
-        # ========================
-#        if current["ma_cross"]:
 
-#            fast = current["ma_fast"]
-#            slow = current["ma_slow"]
+                    # ======================================
+                    # VÀO LỆNH
+                    # ======================================
 
-#            ema_fast = price.ewm(span=fast).mean()
-#            ema_slow = price.ewm(span=slow).mean()
+                    place_order(
+                        signal,
+                        lot,
+                        df,
+                        log,
+                        current
+                    )
 
-#            ax.plot(x, ema_fast, color="#facc15", linewidth=1.5, label=f"EMA{fast}")
-#            ax.plot(x, ema_slow, color="#e2e8f0", linewidth=1.5, label=f"EMA{slow}")
 
-            # 🔥 DETECT CROSS
-#            for i in range(1, len(price)):
-#                pf, ps = ema_fast.iloc[i-1], ema_slow.iloc[i-1]
-#                cf, cs = ema_fast.iloc[i], ema_slow.iloc[i]
-
-                # có giao cắt
-#                if (pf < ps and cf > cs) or (pf > ps and cf < cs):
-
-#                    t = x.iloc[i]
-
-#                    # nội suy điểm giao
-#                    ratio = abs((ps - pf) / ((cf - pf) - (cs - ps) + 1e-6))
-#                    cross_price = pf + (cf - pf) * ratio
-
-#                    cross_type = "BUY" if cf > cs else "SELL"
-
-#                    if not any(c["time"] == t for c in cross_points):
-#                        cross_points.append({
-#                            "type": cross_type,
-#                            "time": t,
-#                            "price": cross_price
-#                        })
-
-#           # 🔥 VẼ SIGNAL
-#           for c in cross_points[-40:]:
-#               artist = ax.scatter(
-#                   c["time"],
-#                   c["price"],
-#                   color="#38bdf8" if c["type"] == "BUY" else "#f472b6",
-#                   s=80,
-#                   marker="^" if c["type"] == "BUY" else "v",
-#                   picker=True
-#               )
-#
-#               signals.append({
-#                   "artist": artist,
-#                   "type": c["type"],
-#                   "time": c["time"],
-#                   "price": c["price"]
-#               })
-#
-#               # ========================
-#               # MA TREND
-#               # ========================
-#       if current.get("ma_trend"):
-#
-#           ma_val = current.get("ma_value", 200)
-#
-#           ma_line = price.rolling(
-#               ma_val
-#           ).mean()
-#
-#           ax.plot(
-#               x,
-#               ma_line,
-#               color="#60a5fa",
-#               linewidth=1.5,
-#               label=f"MA{ma_val}"
-#           )
-#
-#           last_price = price.iloc[-1]
-#           last_ma = ma_line.iloc[-1]
-#
-#           trend_text = "MA UP TREND" if last_price > last_ma else "MA DOWN TREND"
-#           trend_color = "#22c55e" if last_price > last_ma else "#ef4444"
-#
-#           ax.text(
-#               0.02,              # trái màn hình
-#               0.05,              # gần phía trên
-#               trend_text,
-#               transform=ax.transAxes,   # dùng theo % chart
-#               color="white",
-#               fontsize=10,
-#               fontweight="bold",
-#               ha="left",
-#               va="bottom",
-#               bbox=dict(
-#                   facecolor=trend_color,
-#                   boxstyle="round,pad=0.4"
-#               )
-#           )
-#               # ========================
-#       # EMA CUSTOM
-#       # ========================
-#       # ========================
-#       # EMA CUSTOM + TREND
-#       # ========================
-#       if current.get("ema_custom"):
-#
-#           ema_val = current.get("ema_value", 50)
-#
-#           ema_line = price.ewm(span=ema_val).mean()
-#
-#           ax.plot(
-#               x,
-#               ema_line,
-#               color="#f97316",
-#               linewidth=1.5,
-#               label=f"EMA{ema_val}"
-#           )
-#
-#           # ===== TREND LOGIC =====
-#           last_price = price.iloc[-1]
-#           last_ema = ema_line.iloc[-1]
-#
-#           trend_text = "EMA UP TREND" if last_price > last_ema else "EMA DOWN TREND"
-#           trend_color = "#22c55e" if last_price > last_ema else "#ef4444"
-#
-#           # ===== HIỂN THỊ TRÊN LINE =====
-#           ax.text(
-#               0.02,              # trái màn hình
-#               0.05,              # gần phía trên
-#               trend_text,
-#               transform=ax.transAxes,   # dùng theo % chart
-#               color="white",
-#               fontsize=10,
-#               fontweight="bold",
-#               ha="left",
-#               va="bottom",
-#               bbox=dict(
-#                   facecolor=trend_color,
-#                   boxstyle="round,pad=0.4"
-#               )
-#           )
-#               # ========================
-#               # STYLE
-#               # ========================
-#       # ========================
-#       # BOLLINGER BANDS
-#       # ========================
-#       if current.get("bollinger"):
-#
-#           period = 20
-#           std_dev = 2
-#
-#           ma = price.rolling(window=period).mean()
-#           std = price.rolling(window=period).std()
-#
-#           upper = ma + std_dev * std
-#           lower = ma - std_dev * std
-#
-#           ax.plot(x, upper, color="#a78bfa", linewidth=1, label="Boll Upper")
-#           ax.plot(x, lower, color="#a78bfa", linewidth=1, label="Boll Lower")
-#           ax.plot(x, ma, color="#e2e8f0", linewidth=1, label="Boll MA")
-#
-#           # ===== SIGNAL =====
-#           for i in range(1, len(price)):
-#               if price.iloc[i] > upper.iloc[i]:
-#                   artist = ax.scatter(
-#                       x.iloc[i], price.iloc[i],
-#                       color="#22c55e", marker="^", s=60, picker=True
-#                   )
-#
-#                   signals.append({
-#                       "artist": artist,
-#                       "type": "BOLL BUY",
-#                       "time": x.iloc[i],
-#                       "price": price.iloc[i]
-#                   })
-#
-#               elif price.iloc[i] < lower.iloc[i]:
-#                   artist = ax.scatter(
-#                       x.iloc[i], price.iloc[i],
-#                       color="#ef4444", marker="v", s=60, picker=True
-#                   )
-#
-#                   signals.append({
-#                       "artist": artist,
-#                       "type": "BOLL SELL",
-#                       "time": x.iloc[i],
-#                       "price": price.iloc[i]
-#                   })
-#       # ========================
-#       # SUPERTREND
-#       # ========================
-#       if current.get("supertrend"):
-#
-#           period = 10
-#           multiplier = 3
-#
-#           hl2 = (df['high'] + df['low']) / 2
-#           atr = df['high'].rolling(period).max() - df['low'].rolling(period).min()
-#
-#           upperband = hl2 + multiplier * atr
-#           lowerband = hl2 - multiplier * atr
-#
-#           trend = [True]
-#
-#           for i in range(1, len(df)):
-#               if df['close'].iloc[i] > upperband.iloc[i-1]:
-#                   trend.append(True)
-#               elif df['close'].iloc[i] < lowerband.iloc[i-1]:
-#                   trend.append(False)
-#               else:
-#                   trend.append(trend[i-1])
-#
-#           # ===== VẼ =====
-#           for i in range(len(df)):
-#               if trend[i]:
-#                   ax.plot([x.iloc[i]], [price.iloc[i]], marker='o', color="#22c55e")
-#               else:
-#                   ax.plot([x.iloc[i]], [price.iloc[i]], marker='o', color="#ef4444")
-#
-#           # ===== SIGNAL =====
-#           for i in range(1, len(trend)):
-#               if trend[i] and not trend[i-1]:
-#                   artist = ax.scatter(
-#                       x.iloc[i], price.iloc[i],
-#                       color="#22c55e", marker="^", s=80, picker=True
-#                   )
-#
-#                   signals.append({
-#                       "artist": artist,
-#                       "type": "SUPER BUY",
-#                       "time": x.iloc[i],
-#                       "price": price.iloc[i]
-#                   })
-#
-#               elif not trend[i] and trend[i-1]:
-#                   artist = ax.scatter(
-#                       x.iloc[i], price.iloc[i],
-#                       color="#ef4444", marker="v", s=80, picker=True
-#                   )
-#
-#                   signals.append({
-#                       "artist": artist,
-#                       "type": "SUPER SELL",
-#                       "time": x.iloc[i],
-#                       "price": price.iloc[i]
-#                   })    
-#       ax.tick_params(colors="#cbd5f5")
-#
-#       ax.grid(True, color="#334155", linestyle="--", alpha=0.5)
-#
-#       ax.set_title("Trading Chart", color="#e2e8f0")
-#
-#       # ========================
-#       # 🔥 LEGEND (CHÍNH LÀ ĐOẠN M HỎI)
-#       # ========================
-#       handles, labels = ax.get_legend_handles_labels()
-#
-#       if handles:
-#           legend = ax.legend(
-#               loc="upper left",
-#               facecolor="#020617",
-#               edgecolor="#334155",
-#               fontsize=9
-#           )
-#
-#           for text in legend.get_texts():
-#               text.set_color("#e2e8f0")
-#
-#       # ========================
-#       # DRAW
-#       # ========================
-#       # ========================
-#       # TOOLTIP (FIX HOVER)
-#       # ========================
-#       
-#       canvas.draw_idle()
+        # ==================================================
+        # 5. CHẠY LẠI UPDATE
+        # ==================================================
 
         parent.after(2000, update)
+
 
     update()
