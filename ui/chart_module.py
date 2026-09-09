@@ -17,7 +17,7 @@ max_profit_map = {}
 global_log = None
 last_log_time = {}
 log_buffer = []
-LOG_BATCH_SIZE = 2
+LOG_BATCH_SIZE = 120
 import datetime
 import time
 def now_utc_iso():
@@ -78,36 +78,6 @@ def get_data(symbol=None, bars=500):
     df = pd.DataFrame(rates)
     df['time'] = pd.to_datetime(df['time'], unit='s')
     return df
-def is_sideway(df):
-
-    if len(df) < 100:
-        return False
-
-    price = df['close']
-
-    high = df['high'].iloc[-20:].max()
-    low = df['low'].iloc[-20:].min()
-
-    range_price = high - low
-
-    avg_range = (
-        df['high'].rolling(20).max()
-        - df['low'].rolling(20).min()
-    )
-
-    avg_range = avg_range.iloc[-50:].mean()
-
-    ema50 = price.ewm(span=50).mean()
-
-    ema_distance = abs(
-        price.iloc[-1]
-        - ema50.iloc[-1]
-    )
-
-    return (
-        range_price < avg_range * 0.5
-        and ema_distance < avg_range * 0.2
-    )
 def is_fomo_candle(df):
 
     if len(df) < 30:
@@ -1317,7 +1287,6 @@ def get_signal(df, current, log):
             signal = "SELL"
             last_signal_price = price.iloc[-1]
         else:
-            log_common("❌ MA Cross chưa xảy ra")
             check_sideway=False;
             return None
         
